@@ -49,6 +49,9 @@ use crate::util::directories::{
 /// Maximum allowed length for prompt names
 const MAX_PROMPT_NAME_LENGTH: usize = 50;
 
+/// Placeholder string for arguments in prompt files
+const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
+
 /// Regex for validating prompt names (alphanumeric, hyphens, underscores only)
 static PROMPT_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap());
 
@@ -109,6 +112,15 @@ impl Prompt {
     /// Load the content of the prompt file
     fn load_content(&self) -> Result<String, GetPromptError> {
         fs::read_to_string(&self.path).map_err(GetPromptError::Io)
+    }
+
+    /// Check if the prompt content contains ARGUMENTS_PLACEHOLDER
+    fn has_arguments(&self) -> Result<bool, GetPromptError> {
+        if !self.exists() {
+            return Ok(false);
+        }
+        let content = self.load_content()?;
+        Ok(content.contains(ARGUMENTS_PLACEHOLDER))
     }
 
     /// Save content to the prompt file
@@ -197,6 +209,30 @@ impl Prompts {
 
         Ok(prompt_names.into_iter().collect())
     }
+}
+
+/// Parse prompt argument from input string, handling quoted arguments
+/// Returns the parsed argument or None if no argument is provided
+fn parse_prompt_argument(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Handle quoted arguments
+    if (trimmed.starts_with('"') && trimmed.ends_with('"')) ||
+       (trimmed.starts_with('\'') && trimmed.ends_with('\'')) {
+        // Remove quotes and return the content
+        Some(trimmed[1..trimmed.len()-1].to_string())
+    } else {
+        // Return as-is for unquoted arguments
+        Some(trimmed.to_string())
+    }
+}
+
+/// Substitute $ARGUMENTS placeholder with the provided argument value
+fn substitute_arguments(content: &str, argument: &str) -> String {
+    content.replace(ARGUMENTS_PLACEHOLDER, argument)
 }
 
 /// Validate prompt name to ensure it's safe and follows naming conventions
@@ -741,6 +777,38 @@ impl PromptsArgs {
                 )?;
                 for name in &global_prompts {
                     queue!(session.stderr, style::Print("- "), style::Print(name))?;
+                    
+                    // Calculate proper positioning for arguments column
+                    let name_width = UnicodeWidthStr::width(name.as_str()) + 2; // +2 for "- "
+                    let description_padding = description_pos.saturating_sub(name_width);
+                    queue!(session.stderr, style::Print(" ".repeat(description_padding)))?;
+                    
+                    // Print empty description placeholder and move to arguments column
+                    let empty_desc = "(no description)";
+                    queue!(
+                        session.stderr,
+                        style::SetForegroundColor(Color::DarkGrey),
+                        style::Print(empty_desc),
+                        style::SetForegroundColor(Color::Reset),
+                    )?;
+                    
+                    // Check if this global prompt has arguments
+                    if let Ok(prompts) = Prompts::new(name, os) {
+                        if let Ok(has_args) = prompts.global.has_arguments() {
+                            if has_args {
+                                let current_pos = description_pos + UnicodeWidthStr::width(empty_desc);
+                                let arguments_padding = arguments_pos.saturating_sub(current_pos);
+                                queue!(
+                                    session.stderr,
+                                    style::Print(" ".repeat(arguments_padding)),
+                                    style::SetForegroundColor(Color::DarkGrey),
+                                    style::Print("arg*"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+                            }
+                        }
+                    }
+                    
                     queue!(session.stderr, style::Print("\n"))?;
                 }
             }
@@ -759,6 +827,38 @@ impl PromptsArgs {
                 for name in &local_prompts {
                     let has_global_version = overridden_globals.contains(name);
                     queue!(session.stderr, style::Print("- "), style::Print(name),)?;
+                    
+                    // Calculate proper positioning for description column
+                    let name_width = UnicodeWidthStr::width(name.as_str()) + 2; // +2 for "- "
+                    let description_padding = description_pos.saturating_sub(name_width);
+                    queue!(session.stderr, style::Print(" ".repeat(description_padding)))?;
+                    
+                    // Print empty description placeholder
+                    let empty_desc = "(no description)";
+                    queue!(
+                        session.stderr,
+                        style::SetForegroundColor(Color::DarkGrey),
+                        style::Print(empty_desc),
+                        style::SetForegroundColor(Color::Reset),
+                    )?;
+                    
+                    // Check if this local prompt has arguments and position in arguments column
+                    if let Ok(prompts) = Prompts::new(name, os) {
+                        if let Ok(has_args) = prompts.local.has_arguments() {
+                            if has_args {
+                                let current_pos = description_pos + UnicodeWidthStr::width(empty_desc);
+                                let arguments_padding = arguments_pos.saturating_sub(current_pos);
+                                queue!(
+                                    session.stderr,
+                                    style::Print(" ".repeat(arguments_padding)),
+                                    style::SetForegroundColor(Color::DarkGrey),
+                                    style::Print("arg*"),
+                                    style::SetForegroundColor(Color::Reset),
+                                )?;
+                            }
+                        }
+                    }
+                    
                     if has_global_version {
                         queue!(
                             session.stderr,
@@ -1334,7 +1434,46 @@ impl PromptsSubcommand {
             }
 
             // Display the file-based prompt content to the user
-            display_file_prompt_content(&name, &content, session)?;
+            let final_content = if content.contains(ARGUMENTS_PLACEHOLDER) {
+                // Prompt requires arguments
+                let argument_str = arguments
+                    .as_ref()
+                    .and_then(|args| args.first())
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                
+                if let Some(parsed_arg) = parse_prompt_argument(argument_str) {
+                    // Substitute arguments in content
+                    substitute_arguments(&content, &parsed_arg)
+                } else {
+                    // Missing required argument
+                    queue!(
+                        session.stderr,
+                        style::Print("\n"),
+                        style::SetForegroundColor(Color::Yellow),
+                        style::Print("Error: Prompt '"),
+                        style::SetForegroundColor(Color::Cyan),
+                        style::Print(&name),
+                        style::SetForegroundColor(Color::Yellow),
+                        style::Print("' requires an argument but none was provided.\n"),
+                        style::Print("Usage: "),
+                        style::SetForegroundColor(Color::Cyan),
+                        style::Print("@"),
+                        style::Print(&name),
+                        style::Print(" <argument>"),
+                        style::SetForegroundColor(Color::Reset),
+                        style::Print("\n"),
+                    )?;
+                    execute!(session.stderr)?;
+                    return Ok(ChatState::PromptUser {
+                        skip_printing_tools: true,
+                    });
+                }
+            } else {
+                content.clone()
+            };
+
+            display_file_prompt_content(&name, &final_content, session)?;
 
             // Handle local prompt
             session.pending_prompts.clear();
@@ -1342,7 +1481,7 @@ impl PromptsSubcommand {
             // Create a PromptMessage from the local prompt content
             let prompt_message = PromptMessage {
                 role: PromptMessageRole::User,
-                content: PromptMessageContent::Text { text: content.clone() },
+                content: PromptMessageContent::Text { text: final_content },
             };
             session.pending_prompts.push_back(prompt_message);
 
@@ -2395,6 +2534,73 @@ mod tests {
         let config = data.get("config").unwrap();
         assert_eq!(config.get("host").unwrap().as_str().unwrap(), "localhost");
         assert_eq!(config.get("port").unwrap().as_u64().unwrap(), 5432);
+    }
+
+    #[test]
+    fn test_parse_prompt_argument() {
+        // Test empty input
+        assert_eq!(parse_prompt_argument(""), None);
+        assert_eq!(parse_prompt_argument("   "), None);
+
+        // Test unquoted arguments
+        assert_eq!(parse_prompt_argument("hello"), Some("hello".to_string()));
+        assert_eq!(parse_prompt_argument("  world  "), Some("world".to_string()));
+
+        // Test double-quoted arguments
+        assert_eq!(parse_prompt_argument("\"John Doe\""), Some("John Doe".to_string()));
+        assert_eq!(parse_prompt_argument("\"hello world\""), Some("hello world".to_string()));
+
+        // Test single-quoted arguments
+        assert_eq!(parse_prompt_argument("'Jane Smith'"), Some("Jane Smith".to_string()));
+        assert_eq!(parse_prompt_argument("'test value'"), Some("test value".to_string()));
+
+        // Test mixed quotes (should not be treated as quoted)
+        assert_eq!(parse_prompt_argument("\"hello'"), Some("\"hello'".to_string()));
+        assert_eq!(parse_prompt_argument("'world\""), Some("'world\"".to_string()));
+    }
+
+    #[test]
+    fn test_substitute_arguments() {
+        // Test single substitution
+        let content = "Hello, my name is $ARGUMENTS.";
+        let result = substitute_arguments(content, "John");
+        assert_eq!(result, "Hello, my name is John.");
+
+        // Test multiple substitutions
+        let content = "Hi $ARGUMENTS, nice to meet you $ARGUMENTS!";
+        let result = substitute_arguments(content, "Alice");
+        assert_eq!(result, "Hi Alice, nice to meet you Alice!");
+
+        // Test no substitution needed
+        let content = "Hello world!";
+        let result = substitute_arguments(content, "test");
+        assert_eq!(result, "Hello world!");
+
+        // Test empty argument
+        let content = "Name: $ARGUMENTS";
+        let result = substitute_arguments(content, "");
+        assert_eq!(result, "Name: ");
+    }
+
+    #[test]
+    fn test_has_arguments() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_dir = temp_dir.path().to_path_buf();
+
+        // Create prompt with arguments
+        let prompt_with_args = Prompt::new("with_args", test_dir.clone());
+        fs::create_dir_all(&test_dir).unwrap();
+        fs::write(&prompt_with_args.path, "Hello $ARGUMENTS, how are you?").unwrap();
+        assert_eq!(prompt_with_args.has_arguments().unwrap(), true);
+
+        // Create prompt without arguments
+        let prompt_without_args = Prompt::new("without_args", test_dir.clone());
+        fs::write(&prompt_without_args.path, "Hello world!").unwrap();
+        assert_eq!(prompt_without_args.has_arguments().unwrap(), false);
+
+        // Test non-existent prompt
+        let non_existent = Prompt::new("non_existent", test_dir);
+        assert_eq!(non_existent.has_arguments().unwrap(), false);
     }
 
     #[test]
